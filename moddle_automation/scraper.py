@@ -1,0 +1,116 @@
+import json
+import os
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs
+
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
+
+load_dotenv()
+
+MOODLE_URL = os.getenv("MOODLE_URL", "https://moodle.pucrs.br")
+COURSE_URL = os.getenv("COURSE_URL", "https://moodle.pucrs.br/course/view.php?id=92506")
+USERNAME = os.getenv("MOODLE_USERNAME")
+PASSWORD = os.getenv("MOODLE_PASSWORD")
+
+
+def get_course_id(url):
+    return parse_qs(urlparse(url).query).get("id", [None])[0]
+
+
+def login(page):
+    page.goto(f"{MOODLE_URL}/login/index.php")
+    page.fill("#username", USERNAME)
+    page.fill("#password", PASSWORD)
+    page.click("#loginbtn")
+    page.wait_for_load_state("networkidle")
+    if "login" in page.url:
+        raise RuntimeError("Login failed — check your credentials in .env")
+
+
+def scrape_activities(page):
+    page.goto(COURSE_URL)
+    page.wait_for_load_state("networkidle")
+
+    activities = []
+    sections = page.query_selector_all("li.section.main, li.section")
+
+    for section in sections:
+        name_el = section.query_selector(".sectionname, h3.section-title, .content h3")
+        section_name = name_el.inner_text().strip() if name_el else "Unknown Section"
+
+        for item in section.query_selector_all("li.activity"):
+            activity = {"section": section_name}
+
+            link = item.query_selector("a")
+            if link:
+                activity["name"] = link.inner_text().strip()
+                activity["url"] = link.get_attribute("href")
+
+            for cls in (item.get_attribute("class") or "").split():
+                if cls.startswith("modtype_"):
+                    activity["type"] = cls.replace("modtype_", "")
+                    break
+
+            date_el = item.query_selector(".date, .info .date")
+            if date_el:
+                activity["due_date"] = date_el.inner_text().strip()
+
+            activities.append(activity)
+
+    return activities
+
+
+def scrape_grades(page, course_id):
+    page.goto(f"{MOODLE_URL}/grade/report/user/index.php?id={course_id}")
+    page.wait_for_load_state("networkidle")
+
+    grades = []
+    for row in page.query_selector_all("table.user-grade tr"):
+        cells = row.query_selector_all("td, th")
+        if len(cells) < 2:
+            continue
+        item = cells[0].inner_text().strip()
+        grade = cells[1].inner_text().strip()
+        if item and item.lower() not in ("item name", "grade item", ""):
+            grades.append({"item": item, "grade": grade})
+
+    return grades
+
+
+def main():
+    course_id = get_course_id(COURSE_URL)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context().new_page()
+
+        print("Logging in...")
+        login(page)
+        print("Login successful.")
+
+        print("Scraping activities...")
+        activities = scrape_activities(page)
+        print(f"Found {len(activities)} activities.")
+
+        print("Scraping grades...")
+        grades = scrape_grades(page, course_id)
+        print(f"Found {len(grades)} grade items.")
+
+        browser.close()
+
+    output = {
+        "scraped_at": datetime.now().isoformat(),
+        "course_url": COURSE_URL,
+        "activities": activities,
+        "grades": grades,
+    }
+
+    with open("output.json", "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    print("Done! Results saved to output.json")
+
+
+if __name__ == "__main__":
+    main()
